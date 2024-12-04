@@ -1,19 +1,124 @@
-# Starter pipeline
-# Start with a minimal pipeline that you can customize to build and deploy your code.
-# Add steps that build, run tests, deploy, and more:
-# https://aka.ms/yaml
-
 trigger:
-- main
+  branches:
+    include:
+      - main
 
 pool:
-  vmImage: ubuntu-latest
+  vmImage: 'macos-latest' # Usa 'macos-latest' si planeas compilar para iOS y Android.
 
-steps:
-- script: echo Hello, world!
-  displayName: 'Run a one-line script'
+variables:
+  flutterSdkVersion: 'stable'
 
-- script: |
-    echo Add other tasks to build, test, and deploy your project.
-    echo See https://aka.ms/yaml
-  displayName: 'Run a multi-line script'
+stages:
+  - stage: Setup
+    displayName: "Setup Flutter"
+    jobs:
+      - job: InstallFlutter
+        displayName: "Install Flutter SDK"
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: '3.x'
+              addToPath: true
+
+          - script: |
+              git clone https://github.com/flutter/flutter.git -b $(flutterSdkVersion)
+              echo '##vso[task.prependpath]$(pwd)/flutter/bin'
+              flutter --version
+            displayName: "Install Flutter SDK"
+
+  - stage: Analyze
+    displayName: "Analyze Code"
+    dependsOn: Setup
+    jobs:
+      - job: AnalyzeCode
+        displayName: "Flutter Analyze"
+        steps:
+          - script: flutter pub get
+            displayName: "Get Dependencies"
+
+          - script: flutter analyze
+            displayName: "Run Flutter Analyze"
+
+  - stage: Test
+    displayName: "Run Tests"
+    dependsOn: Analyze
+    jobs:
+      - job: RunTests
+        displayName: "Run Flutter Tests"
+        steps:
+          - script: flutter test
+            displayName: "Run Unit Tests"
+
+  - stage: Build
+    displayName: "Build Application"
+    dependsOn: Test
+    jobs:
+      - job: BuildApp
+        displayName: "Build Flutter App"
+        steps:
+          - task: Bash@3
+            inputs:
+              targetType: 'inline'
+              script: |
+                flutter pub get
+                flutter build apk --release
+                flutter build ios --release
+            displayName: "Build APK and IPA"
+
+  - stage: Deploy
+    displayName: "Deploy to Stores"
+    dependsOn: Build
+    jobs:
+      - job: DeployAndroid
+        displayName: "Deploy Android APK to Google Play"
+        steps:
+          - task: DownloadSecureFile@1
+            name: keystore
+            inputs:
+              secureFile: 'keystore.jks'
+
+          - script: |
+              echo $(ANDROID_KEYSTORE_PASSWORD) | gpg --batch --yes --passphrase-fd 0 --decrypt keystore.jks
+              flutter build apk --release --build-number=$(Build.BuildId)
+              echo "APK built successfully."
+            displayName: "Build Android APK"
+
+          - task: GooglePlayRelease@4
+            inputs:
+              serviceEndpoint: 'GooglePlayServiceConnection' # Configura este servicio en Azure DevOps
+              apkFile: '**/app-release.apk'
+              track: 'Production'
+
+      - job: DeployiOS
+        displayName: "Deploy iOS IPA to App Store"
+        steps:
+          - task: InstallAppleCertificate@2
+            inputs:
+              certSecureFile: 'ios_distribution.p12'
+              certPwd: $(CertPassword)
+              keychain: 'temp'
+              deleteCert: true
+
+          - task: InstallAppleProvisioningProfile@1
+            inputs:
+              provisioningProfileLocation: 'secureFiles'
+              provProfileSecureFile: 'AppStore.mobileprovision'
+
+          - script: |
+              flutter build ios --release --no-codesign
+              xcodebuild -workspace ios/Runner.xcworkspace \
+                         -scheme Runner \
+                         -sdk iphoneos \
+                         -configuration AppStoreDistribution \
+                         archive -archivePath build/Runner.xcarchive
+              xcodebuild -exportArchive \
+                         -archivePath build/Runner.xcarchive \
+                         -exportPath build/ \
+                         -exportOptionsPlist ios/exportOptions.plist
+            displayName: "Build iOS IPA"
+
+          - task: AppStoreRelease@1
+            inputs:
+              serviceEndpoint: 'AppStoreServiceConnection' # Configura este servicio en Azure DevOps
+              ipaPath: 'build/Runner.ipa'
